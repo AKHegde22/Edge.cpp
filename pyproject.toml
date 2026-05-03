@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "adaptive-edge-inference"
+version = "1.0.0"
+description = "Continuous batching & thermal-aware scheduling for LLM inference on edge devices (llama.cpp)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Akshay Kumar", github = "AKHegde22" }
+]
+keywords = [
+    "llm", "inference", "edge", "batching", "llama.cpp",
+    "continuous-batching", "scheduler", "mlx"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "llama-cpp-python>=0.3.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+download = ["huggingface-hub>=0.20"]
+mlx = ["mlx-lm>=0.5"]
+dev = ["pytest>=7", "pytest-timeout"]
+
+[project.urls]
+Homepage = "https://github.com/AKHegde22/Inference-proj"
+Repository = "https://github.com/AKHegde22/Inference-proj"
+"Bug Tracker" = "https://github.com/AKHegde22/Inference-proj/issues"
+
+[project.scripts]
+edge-simulate = "edge_batching.simulation:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edge_batching*"]
