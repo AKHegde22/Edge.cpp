@@ -1,39 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import random
+import time
+from dataclasses import dataclass
 from statistics import mean, pstdev
-from typing import Callable
+from typing import Callable, Dict, List, Tuple
 
-from .engine import MockLlamaCppEngine
+from .engine import LlamaCppIterationEngine
 from .models import DeviceProfile, GenerationRequest, WorkloadType
 from .scheduler import AdaptiveBatchScheduler
-
-
-@dataclass(slots=True)
-class VirtualClock:
-    now_s: float = 0.0
-
-    def now(self) -> float:
-        return self.now_s
-
-    def set(self, value_s: float) -> None:
-        self.now_s = max(self.now_s, value_s)
-
-    def advance(self, delta_s: float) -> None:
-        self.now_s += max(0.0, delta_s)
+from .service import EdgeBatchingService
 
 
 @dataclass(slots=True)
 class WorkloadSpec:
+    """Defines the shape of a benchmarking workload."""
     duration_s: float
     realtime_rps: float
     background_rps: float
-    realtime_prompt_tokens: tuple[int, int] = (24, 96)
-    realtime_gen_tokens: tuple[int, int] = (32, 128)
-    background_prompt_tokens: tuple[int, int] = (96, 256)
-    background_gen_tokens: tuple[int, int] = (128, 384)
+    realtime_prompt_tokens: Tuple[int, int] = (24, 96)
+    realtime_gen_tokens: Tuple[int, int] = (32, 128)
+    background_prompt_tokens: Tuple[int, int] = (96, 256)
+    background_gen_tokens: Tuple[int, int] = (128, 384)
 
 
 @dataclass(slots=True)
@@ -47,29 +36,23 @@ class WorkloadEvent:
 @dataclass(slots=True)
 class PolicyBenchmarkResult:
     policy_name: str
-    seeds: list[int]
-    metrics_mean: dict[str, float]
-    metrics_std: dict[str, float]
+    seeds: List[int]
+    metrics_mean: Dict[str, float]
+    metrics_std: Dict[str, float]
     request_count: int
     realtime_count: int
     background_count: int
-
-
-PolicyFactory = Callable[
-    [DeviceProfile, MockLlamaCppEngine, Callable[[], float]],
-    AdaptiveBatchScheduler,
-]
 
 
 def _sample_poisson_arrivals(
     rate_per_second: float,
     duration_s: float,
     rng: random.Random,
-) -> list[float]:
+) -> List[float]:
     if rate_per_second <= 0:
         return []
     t = 0.0
-    arrivals: list[float] = []
+    arrivals: List[float] = []
     while True:
         t += rng.expovariate(rate_per_second)
         if t > duration_s:
@@ -78,9 +61,9 @@ def _sample_poisson_arrivals(
     return arrivals
 
 
-def generate_workload_events(spec: WorkloadSpec, seed: int) -> list[WorkloadEvent]:
+def generate_workload_events(spec: WorkloadSpec, seed: int) -> List[WorkloadEvent]:
     rng = random.Random(seed)
-    events: list[WorkloadEvent] = []
+    events: List[WorkloadEvent] = []
 
     for arrival in _sample_poisson_arrivals(spec.realtime_rps, spec.duration_s, rng):
         events.append(
@@ -106,7 +89,7 @@ def generate_workload_events(spec: WorkloadSpec, seed: int) -> list[WorkloadEven
     return events
 
 
-def _percentile(values: list[float], p: float) -> float:
+def _percentile(values: List[float], p: float) -> float:
     if not values:
         return 0.0
     if len(values) == 1:
@@ -123,156 +106,118 @@ def _percentile(values: list[float], p: float) -> float:
 
 def run_policy_trial(
     policy_name: str,
-    policy_factory: PolicyFactory,
+    policy_class: type[AdaptiveBatchScheduler],
+    engine: LlamaCppIterationEngine,
     device: DeviceProfile,
     spec: WorkloadSpec,
     seed: int,
-) -> tuple[dict[str, float], dict[str, int]]:
+) -> Tuple[Dict[str, float], Dict[str, int]]:
+    """
+    Runs a real-time benchmarking trial using a real model and engine.
+    """
     events = generate_workload_events(spec, seed)
-    clock = VirtualClock()
-    engine = MockLlamaCppEngine(
-        sleep_for_runtime=False,
-        jitter_fraction=0.0,
-        time_source=clock.now,
-    )
-    scheduler = policy_factory(device, engine, clock.now)
+    scheduler = policy_class(device=device, engine=engine)
+    service = EdgeBatchingService(scheduler)
+    service.start()
 
-    submitted = 0
-    realtime_submitted = 0
-    background_submitted = 0
-    total_generated_tokens = 0
-    batch_sizes: list[float] = []
-    realtime_latency_ms: list[float] = []
-    background_latency_ms: list[float] = []
-    realtime_queue_ms: list[float] = []
-    background_queue_ms: list[float] = []
+    print(f"  Starting trial: policy={policy_name} seed={seed} events={len(events)}")
+    
+    start_time = time.monotonic()
+    futures = []
+    
+    # Process events in real-time
+    for event in events:
+        now = time.monotonic()
+        wait_time = (start_time + event.arrival_s) - now
+        if wait_time > 0:
+            time.sleep(wait_time)
+            
+        req = GenerationRequest(
+            request_id=f"{policy_name}-{seed}-{len(futures)}",
+            prompt="Tell me a short story about edge computing."[:event.prompt_tokens], # Truncated for token count approximation
+            prompt_tokens=event.prompt_tokens,
+            max_new_tokens=event.gen_tokens,
+            workload=event.workload,
+        )
+        futures.append((event, service.submit(req)))
 
-    next_event_index = 0
-    request_index = 0
+    # Wait for all to finish
+    results = []
+    for event, future in futures:
+        try:
+            res = future.result(timeout=120) # 2 min timeout per request
+            results.append((event, res))
+        except Exception as e:
+            print(f"    Request failed: {e}")
 
-    while next_event_index < len(events) or scheduler.pending() > 0:
-        if scheduler.pending() == 0 and next_event_index < len(events):
-            clock.set(events[next_event_index].arrival_s)
-
-        while next_event_index < len(events):
-            event = events[next_event_index]
-            if event.arrival_s > clock.now():
-                break
-            req = GenerationRequest(
-                request_id=f"{policy_name}-{seed}-{request_index}",
-                prompt="synthetic",
-                prompt_tokens=event.prompt_tokens,
-                max_new_tokens=event.gen_tokens,
-                workload=event.workload,
-                submitted_at=event.arrival_s,
-            )
-            scheduler.submit(req)
-            request_index += 1
-            submitted += 1
-            if event.workload == WorkloadType.REALTIME:
-                realtime_submitted += 1
-            else:
-                background_submitted += 1
-            next_event_index += 1
-
-        run = scheduler.run_once()
-        if run is None:
-            if next_event_index < len(events):
-                clock.set(events[next_event_index].arrival_s)
-            continue
-
-        batch_start_s = clock.now()
-        batch_runtime_s = max(0.0, run.metrics.runtime_ms / 1000.0)
-        batch_end_s = batch_start_s + batch_runtime_s
-
-        total_generated_tokens += run.metrics.generated_tokens
-        batch_sizes.append(float(run.metrics.batch_size))
-
-        for req in run.requests:
-            queue_ms = max(0.0, (batch_start_s - req.submitted_at) * 1000.0)
-            latency_ms = max(0.0, (batch_end_s - req.submitted_at) * 1000.0)
-            if req.workload == WorkloadType.REALTIME:
-                realtime_queue_ms.append(queue_ms)
-                realtime_latency_ms.append(latency_ms)
-            else:
-                background_queue_ms.append(queue_ms)
-                background_latency_ms.append(latency_ms)
-
-        clock.advance(batch_runtime_s)
-
-    makespan_s = max(clock.now(), spec.duration_s)
-    completed = len(realtime_latency_ms) + len(background_latency_ms)
+    service.stop()
+    end_time = time.monotonic()
+    
+    # Calculate metrics
+    realtime_latencies = [r.end_to_end_latency_ms for e, r in results if e.workload == WorkloadType.REALTIME]
+    background_latencies = [r.end_to_end_latency_ms for e, r in results if e.workload == WorkloadType.BACKGROUND]
+    
+    total_tokens = sum(r.total_tokens for e, r in results)
+    makespan = end_time - start_time
+    
     metrics = {
-        "throughput_rps": completed / max(1e-9, makespan_s),
-        "generated_tokens_per_second": total_generated_tokens / max(1e-9, makespan_s),
-        "avg_batch_size": mean(batch_sizes) if batch_sizes else 0.0,
-        "realtime_latency_p50_ms": _percentile(realtime_latency_ms, 0.50),
-        "realtime_latency_p95_ms": _percentile(realtime_latency_ms, 0.95),
-        "realtime_latency_p99_ms": _percentile(realtime_latency_ms, 0.99),
-        "background_latency_p50_ms": _percentile(background_latency_ms, 0.50),
-        "background_latency_p95_ms": _percentile(background_latency_ms, 0.95),
-        "realtime_queue_p95_ms": _percentile(realtime_queue_ms, 0.95),
-        "background_queue_p95_ms": _percentile(background_queue_ms, 0.95),
-        "background_completion_rate": (
-            len(background_latency_ms) / background_submitted
-            if background_submitted
-            else 1.0
-        ),
+        "throughput_rps": len(results) / max(1e-9, makespan),
+        "generated_tokens_per_second": total_tokens / max(1e-9, makespan),
+        "realtime_latency_p50_ms": _percentile(realtime_latencies, 0.50),
+        "realtime_latency_p95_ms": _percentile(realtime_latencies, 0.95),
+        "background_latency_p50_ms": _percentile(background_latencies, 0.50),
+        "background_latency_p95_ms": _percentile(background_latencies, 0.95),
     }
 
     counts = {
-        "submitted": submitted,
-        "realtime_submitted": realtime_submitted,
-        "background_submitted": background_submitted,
+        "submitted": len(events),
+        "completed": len(results),
+        "realtime_submitted": sum(1 for e in events if e.workload == WorkloadType.REALTIME),
+        "background_submitted": sum(1 for e in events if e.workload == WorkloadType.BACKGROUND),
     }
+    
     return metrics, counts
 
 
 def run_benchmark_suite(
+    engine: LlamaCppIterationEngine,
     device: DeviceProfile,
     spec: WorkloadSpec,
-    policies: dict[str, PolicyFactory],
-    seeds: list[int],
-) -> list[PolicyBenchmarkResult]:
-    results: list[PolicyBenchmarkResult] = []
-    for policy_name, policy_factory in policies.items():
-        per_seed_metrics: list[dict[str, float]] = []
-        counts_reference: dict[str, int] | None = None
+    policies: Dict[str, type[AdaptiveBatchScheduler]],
+    seeds: List[int],
+) -> List[PolicyBenchmarkResult]:
+    results: List[PolicyBenchmarkResult] = []
+    for policy_name, policy_class in policies.items():
+        per_seed_metrics = []
+        counts_ref = None
         for seed in seeds:
             metrics, counts = run_policy_trial(
                 policy_name=policy_name,
-                policy_factory=policy_factory,
+                policy_class=policy_class,
+                engine=engine,
                 device=device,
                 spec=spec,
-                seed=seed,
+                seed=seed
             )
             per_seed_metrics.append(metrics)
-            if counts_reference is None:
-                counts_reference = counts
+            counts_ref = counts
 
-        metric_names = per_seed_metrics[0].keys() if per_seed_metrics else []
-        metrics_mean = {
-            name: mean([item[name] for item in per_seed_metrics])
-            for name in metric_names
-        }
-        metrics_std = {
-            name: pstdev([item[name] for item in per_seed_metrics])
-            for name in metric_names
-        }
-        counts_reference = counts_reference or {
-            "submitted": 0,
-            "realtime_submitted": 0,
-            "background_submitted": 0,
-        }
+        if not per_seed_metrics:
+            continue
+
+        metric_names = per_seed_metrics[0].keys()
+        metrics_mean = {name: mean([m[name] for m in per_seed_metrics]) for name in metric_names}
+        metrics_std = {name: pstdev([m[name] for m in per_seed_metrics]) for name in metric_names}
+        
         results.append(
             PolicyBenchmarkResult(
                 policy_name=policy_name,
-                seeds=list(seeds),
+                seeds=seeds,
                 metrics_mean=metrics_mean,
                 metrics_std=metrics_std,
-                request_count=counts_reference["submitted"],
-                realtime_count=counts_reference["realtime_submitted"],
-                background_count=counts_reference["background_submitted"],
+                request_count=counts_ref["submitted"],
+                realtime_count=counts_ref["realtime_submitted"],
+                background_count=counts_ref["background_submitted"]
             )
         )
     return results

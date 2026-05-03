@@ -1,6 +1,6 @@
 # Adaptive Edge Inference — Continuous Batching with Thermal-Aware Scheduling
 
-> A research framework for low-latency LLM inference on edge devices, featuring iteration-level continuous batching, in-flight request preemption, and power-aware thermal scheduling over llama.cpp.
+> A production-ready research framework for low-latency LLM inference on edge devices, featuring iteration-level continuous batching, in-flight request preemption, and power-aware thermal scheduling over llama.cpp.
 
 ---
 
@@ -11,7 +11,7 @@
 | **Continuous Batching** | Token-level iteration loop via the llama.cpp low-level API — new requests are injected between decode steps, not between batches. |
 | **In-Flight Preemption** | Realtime (interactive) requests instantly preempt background tasks without waiting for a batch to finish. |
 | **Power-Aware Thermal Scheduling** | A hardware monitor feeds thermal pressure and battery level into the scheduler, which throttles background work under thermal stress. |
-| **Baseline Comparison Suite** | Built-in FIFO, Fixed-Batch, Throughput-First, and Single-Request baselines for controlled evaluation. |
+| **Real Baseline Suite** | Built-in Fixed-Batch, Throughput-First, and Single-Request baselines for empirical evaluation. |
 
 ---
 
@@ -25,8 +25,8 @@
 │  │  Monitor   │   │                              │   │
 │  │ (thermal,  │   │  ┌─────────┐  ┌──────────┐  │   │
 │  │  battery)  │   │  │Realtime │  │Background│  │   │
-│  └───────────┘   │  │  Queue  │  │  Queue   │  │   │
-│                  │  └────┬────┘  └────┬─────┘  │   │
+│  │  plugged   │   │  │  Queue  │  │  Queue   │  │   │
+│  └───────────┘   │  └────┬────┘  └────┬─────┘  │   │
 │                  │       │   Preemption│        │   │
 │                  │       ▼            ▼        │   │
 │                  │  ┌──────────────────────┐   │   │
@@ -49,18 +49,17 @@
 ```
 edge_batching/
 ├── models.py              # Data models — GenerationRequest, DeviceProfile, WorkloadType
-├── engine.py              # Inference engines — LlamaCppIterationEngine, MockEngine
+├── engine.py              # Production engine — LlamaCppIterationEngine (100% Real)
 ├── scheduler.py           # Core scheduler — continuous batching + preemption logic
 ├── service.py             # Async service layer — Future-based API + hardware monitor
-├── hardware_monitor.py    # Cross-platform thermal pressure & battery monitoring (macOS/Linux/Windows)
-├── policies.py            # Baseline schedulers — Fixed, Throughput-First, Single
-├── benchmark.py           # Synthetic workload generator + policy comparison framework
-├── research.py            # Multi-seed experiment runner with CSV/Markdown output
-├── simulation.py          # Interactive CLI simulation for quick validation
-└── tuning.py              # Grid-search parameter tuner for scheduler knobs
+├── hardware_monitor.py    # Cross-platform thermal pressure & battery monitoring
+├── policies.py            # Real baseline schedulers — Fixed, Throughput-First, Single
+├── benchmark.py           # Real-time workload generator + policy comparison framework
+├── research.py            # Empirical experiment runner with CSV/Markdown output
+└── simulation.py          # Interactive CLI simulation for live validation
 
 download_model.py          # Downloads Qwen-0.5B GGUF for local testing
-RESULTS.md                 # Full empirical results with raw metrics
+RESULTS.md                 # Empirical results with raw metrics
 ```
 
 ---
@@ -79,20 +78,20 @@ pip install llama-cpp-python numpy huggingface-hub
 python download_model.py
 ```
 
-### 3. Run the Synthetic Benchmark Suite
+### 3. Run the Empirical Research Suite
 
 ```bash
-python -m edge_batching.research --output-dir research_outputs --seeds 101,202,303
+python -m edge_batching.research --model models/qwen1_5-0_5b-chat-q4_k_m.gguf
 ```
 
 This generates:
-- `research_outputs/benchmark_results.csv` — raw metrics per policy per seed
-- `research_outputs/findings.md` — formatted comparison tables
+- `research_outputs/real_benchmark_results.csv` — raw metrics from real inference
+- `research_outputs/real_findings.md` — formatted comparison tables
 
-### 4. Run the Parameter Tuner
+### 4. Run Interactive Simulation
 
 ```bash
-python -m edge_batching.tuning --output-csv research_outputs/adaptive_tuning.csv
+python -m edge_batching.simulation --model models/qwen1_5-0_5b-chat-q4_k_m.gguf
 ```
 
 ---
@@ -109,8 +108,10 @@ from edge_batching import (
     WorkloadType,
 )
 
+# 1. Initialize real engine
 engine = LlamaCppIterationEngine(model_path="models/qwen1_5-0_5b-chat-q4_k_m.gguf")
 
+# 2. Define hardware profile
 device = DeviceProfile(
     name="macbook-m2",
     memory_gb=16.0,
@@ -120,11 +121,12 @@ device = DeviceProfile(
     background_weight=0.30,
 )
 
+# 3. Setup scheduler and service
 scheduler = AdaptiveBatchScheduler(device=device, engine=engine)
 service = EdgeBatchingService(scheduler)
 service.start()
 
-# Submit a realtime request — gets priority over any background work
+# 4. Submit a realtime request
 future = service.submit(
     GenerationRequest(
         request_id="chat-1",
@@ -139,35 +141,6 @@ result = future.result(timeout=10.0)
 print(result.output_text)
 service.stop()
 ```
-
----
-
-## Key Research Results
-
-Full results with raw metrics are in [`RESULTS.md`](RESULTS.md).
-
-| Experiment | Key Finding |
-| :--- | :--- |
-| **Adaptive vs. FIFO** | 2.1× faster realtime latency under 10-task saturation (40s vs 84s) |
-| **Llama-cpp vs. MLX** | 38% higher throughput at saturation; 17% faster interruption response |
-| **SLA Sweep** | Adaptive scheduler meets tighter SLA targets than MLX across all thresholds |
-| **Continuous Batching** | TTFT drops from ~10s (batch-level) to <100ms (iteration-level) |
-| **Thermal Scheduling** | Background tasks auto-throttled under thermal pressure; battery-aware mode |
-
----
-
-## Tuning Knobs
-
-The `DeviceProfile` is the primary control surface:
-
-| Parameter | Effect |
-| :--- | :--- |
-| `target_realtime_latency_ms` | Lower → more aggressive latency protection |
-| `background_weight` | Higher → more throughput share for background tasks |
-| `max_queue_wait_ms` | Lower → earlier anti-starvation trigger |
-| `max_batch_size` | Hardware safety limit for concurrent sequences |
-| `thermal_state` | Auto-updated by hardware monitor; affects batch admission |
-| `battery_level` | Auto-updated; triggers low-power mode below 20% |
 
 ---
 

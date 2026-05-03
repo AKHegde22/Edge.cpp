@@ -4,103 +4,102 @@ import argparse
 import random
 import time
 
-from .engine import MockLlamaCppEngine
+from .engine import LlamaCppIterationEngine
 from .models import DeviceProfile, GenerationRequest, WorkloadType
 from .scheduler import AdaptiveBatchScheduler
+from .service import EdgeBatchingService
 
 
 def run_simulation(
+    model_path: str,
     rounds: int,
     realtime_per_round: int,
     background_per_round: int,
     sleep_between_rounds_s: float,
 ) -> None:
+    print(f"Initializing real-time simulation with model: {model_path}")
+    
     device = DeviceProfile(
-        name="jetson-like",
-        memory_gb=8.0,
-        compute_score=4.0,
-        max_batch_size=16,
-        target_realtime_latency_ms=220.0,
+        name="local-device",
+        memory_gb=16.0,
+        compute_score=5.0,
+        max_batch_size=8,
+        target_realtime_latency_ms=250.0,
         background_weight=0.30,
     )
-    engine = MockLlamaCppEngine(sleep_for_runtime=True)
+    
+    engine = LlamaCppIterationEngine(model_path=model_path)
     scheduler = AdaptiveBatchScheduler(device=device, engine=engine)
+    service = EdgeBatchingService(scheduler)
+    service.start()
 
     req_index = 0
-    for round_idx in range(1, rounds + 1):
-        for _ in range(realtime_per_round):
-            req = GenerationRequest(
-                request_id=f"rt-{req_index}",
-                prompt="User chat request",
-                prompt_tokens=random.randint(24, 96),
-                max_new_tokens=random.randint(32, 128),
-                workload=WorkloadType.REALTIME,
-            )
-            scheduler.submit(req)
-            req_index += 1
-
-        for _ in range(background_per_round):
-            req = GenerationRequest(
-                request_id=f"bg-{req_index}",
-                prompt="Background summarization task",
-                prompt_tokens=random.randint(64, 192),
-                max_new_tokens=random.randint(96, 256),
-                workload=WorkloadType.BACKGROUND,
-            )
-            scheduler.submit(req)
-            req_index += 1
-
-        runs = scheduler.drain(max_batches=3)
-        if not runs:
-            print(f"round={round_idx} no work")
-        else:
-            last = runs[-1]
-            realtime_count = sum(
-                1 for item in last.requests if item.workload == WorkloadType.REALTIME
-            )
-            background_count = len(last.requests) - realtime_count
-            print(
-                "round=%d batches=%d last_limit=%d batch_size=%d realtime=%d background=%d "
-                "runtime_ms=%.2f"
-                % (
-                    round_idx,
-                    len(runs),
-                    last.batch_limit,
-                    last.metrics.batch_size,
-                    realtime_count,
-                    background_count,
-                    last.metrics.runtime_ms,
+    try:
+        for round_idx in range(1, rounds + 1):
+            print(f"\n--- Round {round_idx} ---")
+            
+            # Inject realtime requests
+            for _ in range(realtime_per_round):
+                req = GenerationRequest(
+                    request_id=f"rt-{req_index}",
+                    prompt="Summarize the benefits of edge computing.",
+                    prompt_tokens=32,
+                    max_new_tokens=random.randint(32, 64),
+                    workload=WorkloadType.REALTIME,
                 )
-            )
-        time.sleep(max(0.0, sleep_between_rounds_s))
+                service.submit(req)
+                print(f"  Submitted Realtime: {req.request_id}")
+                req_index += 1
 
-    remaining_runs = scheduler.drain()
-    if remaining_runs:
-        print(f"drained_remaining_batches={len(remaining_runs)}")
+            # Inject background requests
+            for _ in range(background_per_round):
+                req = GenerationRequest(
+                    request_id=f"bg-{req_index}",
+                    prompt="Explain the difference between Llama 3 and Mistral.",
+                    prompt_tokens=32,
+                    max_new_tokens=random.randint(64, 128),
+                    workload=WorkloadType.BACKGROUND,
+                )
+                service.submit(req)
+                print(f"  Submitted Background: {req.request_id}")
+                req_index += 1
+
+            # Monitor progress
+            time.sleep(sleep_between_rounds_s)
+            snap = scheduler.snapshot()
+            print(f"  Status: RT_Queued={snap.queued_realtime} BG_Queued={snap.queued_background} TPS={snap.avg_tokens_per_second:.1f}")
+
+        print("\nAll rounds submitted. Draining remaining requests...")
+        while scheduler.pending() > 0:
+            snap = scheduler.snapshot()
+            print(f"  Draining: Pending={scheduler.pending()} TPS={snap.avg_tokens_per_second:.1f}", end="\r")
+            time.sleep(1.0)
+            
+    finally:
+        service.stop()
+        print("\nSimulation complete.")
 
     snap = scheduler.snapshot()
-    print(
-        "completed_requests=%d completed_batches=%d avg_batch_ms=%.2f avg_tps=%.2f"
-        % (
-            snap.completed_requests,
-            snap.completed_batches,
-            snap.avg_batch_runtime_ms,
-            snap.avg_tokens_per_second,
-        )
-    )
+    print("\nFinal Statistics:")
+    print(f"  Completed Requests: {snap.completed_requests}")
+    print(f"  Completed Batches:  {snap.completed_batches}")
+    print(f"  Avg Batch Latency:  {snap.avg_batch_runtime_ms:.2f} ms")
+    print(f"  Avg Throughput:     {snap.avg_tokens_per_second:.2f} tokens/s")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Simulate adaptive edge batching behavior under mixed workloads."
+        description="Simulate adaptive edge batching behavior with a real LLM model."
     )
-    parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--realtime-per-round", type=int, default=2)
+    parser.add_argument("--model", type=str, required=True, help="Path to GGUF model file")
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--realtime-per-round", type=int, default=1)
     parser.add_argument("--background-per-round", type=int, default=1)
-    parser.add_argument("--sleep-between-rounds", type=float, default=0.05)
+    parser.add_argument("--sleep-between-rounds", type=float, default=5.0)
     args = parser.parse_args()
 
     run_simulation(
+        model_path=args.model,
         rounds=args.rounds,
         realtime_per_round=args.realtime_per_round,
         background_per_round=args.background_per_round,

@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "adaptive-edge-inference"
-version = "1.0.0"
+version = "1.1.0"
 description = "Continuous batching & thermal-aware scheduling for LLM inference on edge devices (llama.cpp)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -13,7 +13,7 @@ authors = [
 ]
 keywords = [
     "llm", "inference", "edge", "batching", "llama.cpp",
-    "continuous-batching", "scheduler", "mlx"
+    "continuous-batching", "scheduler"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -33,7 +33,6 @@ dependencies = [
 
 [project.optional-dependencies]
 download = ["huggingface-hub>=0.20"]
-mlx = ["mlx-lm>=0.5"]
 dev = ["pytest>=7", "pytest-timeout"]
 
 [project.urls]

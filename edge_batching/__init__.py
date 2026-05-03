@@ -1,7 +1,8 @@
 """Adaptive batching primitives for edge-oriented llama.cpp serving."""
 
 from .benchmark import PolicyBenchmarkResult, WorkloadSpec, run_benchmark_suite
-from .engine import BatchEngine, LlamaCppIterationEngine, MockLlamaCppEngine
+from .engine import LlamaCppIterationEngine
+from .hardware_monitor import HardwareMonitor
 from .models import (
     BatchExecutionMetrics,
     BatchRun,
@@ -21,7 +22,6 @@ from .service import EdgeBatchingService
 
 __all__ = [
     "AdaptiveBatchScheduler",
-    "BatchEngine",
     "BatchExecutionMetrics",
     "BatchRun",
     "DeviceProfile",
@@ -29,8 +29,8 @@ __all__ = [
     "FixedBatchScheduler",
     "GenerationRequest",
     "GenerationResult",
+    "HardwareMonitor",
     "LlamaCppIterationEngine",
-    "MockLlamaCppEngine",
     "PolicyBenchmarkResult",
     "RealtimeSingleScheduler",
     "SchedulerSnapshot",

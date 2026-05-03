@@ -1,48 +1,94 @@
 from __future__ import annotations
 
-from .engine import BatchEngine
-from .models import DeviceProfile
-from .scheduler import AdaptiveBatchScheduler, _clamp
+from typing import List
+
+from .engine import LlamaCppIterationEngine
+from .models import DeviceProfile, GenerationResult, WorkloadType
+from .scheduler import AdaptiveBatchScheduler
 
 
 class FixedBatchScheduler(AdaptiveBatchScheduler):
-    """Baseline scheduler with constant batch limit."""
+    """
+    Real baseline scheduler that enforces a static batch size limit.
+    Useful for comparing continuous batching with/without adaptive sizing.
+    """
 
     def __init__(
         self,
         device: DeviceProfile,
-        engine: BatchEngine,
-        fixed_batch_size: int = 4,
+        engine: LlamaCppIterationEngine,
+        fixed_limit: int = 4,
         **kwargs,
     ):
         super().__init__(device=device, engine=engine, **kwargs)
-        self.fixed_batch_size = max(device.min_batch_size, fixed_batch_size)
+        self.fixed_limit = max(1, fixed_limit)
 
-    def _select_batch_limit_locked(self, now: float) -> int:
-        total_q = len(self._realtime_q) + len(self._background_q)
-        if total_q <= 0:
-            return 0
-        cap = self.device.effective_batch_capacity()
-        fixed = _clamp(self.fixed_batch_size, self.device.min_batch_size, cap)
-        return min(fixed, total_q)
+    def run_step(self) -> List[GenerationResult]:
+        """Override to use a fixed batch limit instead of the device max."""
+        with self._cv:
+            self._active_batch = [r for r in self._active_batch if not r.is_finished]
+            
+            # Injection with fixed limit
+            while len(self._active_batch) < self.fixed_limit:
+                if self._realtime_q:
+                    self._active_batch.append(self._realtime_q.popleft())
+                elif self._background_q:
+                    # Even in fixed mode, we still honor thermal state for safety
+                    if self.device.thermal_state in ["serious", "critical"]:
+                        break
+                    self._active_batch.append(self._background_q.popleft())
+                else:
+                    break
+
+            if not self._active_batch:
+                return []
+
+        # Rest of logic is the same as parent
+        return super().run_step()
 
 
 class ThroughputFirstScheduler(AdaptiveBatchScheduler):
-    """Baseline scheduler that maximizes batch size for throughput."""
+    """
+    Real baseline scheduler that ignores latency targets and always tries 
+    to fill the hardware to its maximum batch capacity.
+    """
 
-    def _select_batch_limit_locked(self, now: float) -> int:
-        total_q = len(self._realtime_q) + len(self._background_q)
-        if total_q <= 0:
-            return 0
-        cap = self.device.effective_batch_capacity()
-        return min(cap, total_q)
+    def run_step(self) -> List[GenerationResult]:
+        """Same as Adaptive but without the preemption or thermal throttling of background."""
+        with self._cv:
+            self._active_batch = [r for r in self._active_batch if not r.is_finished]
+            
+            while len(self._active_batch) < self.device.max_batch_size:
+                if self._realtime_q:
+                    self._active_batch.append(self._realtime_q.popleft())
+                elif self._background_q:
+                    self._active_batch.append(self._background_q.popleft())
+                else:
+                    break
+                    
+            if not self._active_batch:
+                return []
+                
+        return super().run_step()
 
 
 class RealtimeSingleScheduler(AdaptiveBatchScheduler):
-    """Latency-first baseline with no batching (batch size=1)."""
+    """
+    Real baseline scheduler that processes only one request at a time (batch size = 1).
+    Ensures minimum possible latency for that single request but zero throughput gain.
+    """
 
-    def _select_batch_limit_locked(self, now: float) -> int:
-        total_q = len(self._realtime_q) + len(self._background_q)
-        if total_q <= 0:
-            return 0
-        return 1
+    def run_step(self) -> List[GenerationResult]:
+        with self._cv:
+            self._active_batch = [r for r in self._active_batch if not r.is_finished]
+            
+            if not self._active_batch:
+                if self._realtime_q:
+                    self._active_batch.append(self._realtime_q.popleft())
+                elif self._background_q:
+                    self._active_batch.append(self._background_q.popleft())
+            
+            if not self._active_batch:
+                return []
+                
+        return super().run_step()

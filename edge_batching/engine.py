@@ -1,135 +1,76 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import random
+import logging
+import threading
 import time
-from typing import Callable, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-from .models import BatchExecutionMetrics, GenerationRequest, GenerationResult
+try:
+    import llama_cpp
+    import numpy as np
+    _HAS_LLAMA = True
+except ImportError:
+    _HAS_LLAMA = False
 
+from .models import GenerationRequest, GenerationResult
 
-class BatchEngine(Protocol):
-    def execute_batch(
-        self,
-        batch: Sequence[GenerationRequest],
-    ) -> tuple[list[GenerationResult], BatchExecutionMetrics]:
-        """Execute a request batch and return individual outputs + runtime metrics."""
+logger = logging.getLogger(__name__)
 
-
-@dataclass(slots=True)
-class MockLlamaCppEngine:
-    """
-    Timing model for local scheduler validation.
-
-    This does not run a model. It emulates latency behavior where batching
-    increases throughput but can increase single-request tail latency.
-    """
-
-    prefill_ms_per_token: float = 0.35
-    decode_ms_per_token: float = 2.4
-    parallel_efficiency: float = 0.62
-    batch_overhead_ms: float = 2.5
-    jitter_fraction: float = 0.03
-    sleep_for_runtime: bool = True
-    time_source: Callable[[], float] | None = None
-    simulate_elapsed_when_not_sleeping: bool = True
-
-    def execute_batch(
-        self,
-        batch: Sequence[GenerationRequest],
-    ) -> tuple[list[GenerationResult], BatchExecutionMetrics]:
-        if not batch:
-            empty_metrics = BatchExecutionMetrics(
-                batch_size=0,
-                runtime_ms=0.0,
-                prompt_tokens=0,
-                generated_tokens=0,
-            )
-            return [], empty_metrics
-
-        clock = self.time_source or time.monotonic
-        start = clock()
-        batch_size = len(batch)
-        prompt_tokens = sum(item.prompt_tokens for item in batch)
-        generated_tokens = sum(item.max_new_tokens for item in batch)
-
-        speedup = 1.0 + (batch_size - 1) * self.parallel_efficiency
-        runtime_ms = (
-            (prompt_tokens * self.prefill_ms_per_token)
-            + (generated_tokens * self.decode_ms_per_token)
-        ) / speedup + self.batch_overhead_ms
-
-        if self.jitter_fraction > 0:
-            low = max(0.0, 1.0 - self.jitter_fraction)
-            high = 1.0 + self.jitter_fraction
-            runtime_ms *= random.uniform(low, high)
-
-        if self.sleep_for_runtime:
-            time.sleep(runtime_ms / 1000.0)
-            end = clock()
-        elif self.simulate_elapsed_when_not_sleeping:
-            end = start + runtime_ms / 1000.0
-        else:
-            end = clock()
-        total_latency_ms = (end - start) * 1000.0
-        results: list[GenerationResult] = []
-        for req in batch:
-            queue_wait_ms = (start - req.submitted_at) * 1000.0
-            e2e_ms = (end - req.submitted_at) * 1000.0
-            text = f"[mock] request={req.request_id} tokens={req.max_new_tokens}"
-            results.append(
-                GenerationResult(
-                    request_id=req.request_id,
-                    workload=req.workload,
-                    output_text=text,
-                    queue_wait_ms=max(0.0, queue_wait_ms),
-                    end_to_end_latency_ms=max(total_latency_ms, e2e_ms),
-                )
-            )
-
-        metrics = BatchExecutionMetrics(
-            batch_size=batch_size,
-            runtime_ms=runtime_ms,
-            prompt_tokens=prompt_tokens,
-            generated_tokens=generated_tokens,
-        )
-        return results, metrics
-
-
-import llama_cpp
-from typing import Dict, List, Optional
 
 @dataclass
 class LlamaCppIterationEngine:
     """
-    Advanced engine implementing Continuous Batching (Iteration-level decoding).
-    Uses llama.cpp low-level API for precise control.
+    Production-grade engine implementing Continuous Batching (Iteration-level decoding).
+    Uses llama.cpp low-level API for precise control over token-by-token execution.
     """
     model_path: str
     n_ctx: int = 2048
     n_threads: int = 8
-    
+    n_batch: int = 512
+    max_sequences: int = 16
+
     _model: Optional[llama_cpp.llama_model] = field(init=False, default=None)
     _ctx: Optional[llama_cpp.llama_context] = field(init=False, default=None)
     _batch: Optional[llama_cpp.llama_batch] = field(init=False, default=None)
+    _lock: threading.Lock = field(init=False, default_factory=threading.Lock)
     
+    # Track available slots in the KV cache sequence space
+    _free_slots: List[int] = field(init=False)
+
     def __post_init__(self):
+        if not _HAS_LLAMA:
+            raise ImportError(
+                "llama-cpp-python and numpy are required for LlamaCppIterationEngine. "
+                "Install them with: pip install llama-cpp-python numpy"
+            )
+
         params = llama_cpp.llama_model_default_params()
         self._model = llama_cpp.llama_load_model_from_file(self.model_path.encode(), params)
-        
+        if not self._model:
+            raise RuntimeError(f"Failed to load model from {self.model_path}")
+
         ctx_params = llama_cpp.llama_context_default_params()
         ctx_params.n_ctx = self.n_ctx
         ctx_params.n_threads = self.n_threads
-        ctx_params.n_seq_max = 16 # Support up to 16 concurrent sequences
-        self._ctx = llama_cpp.llama_new_context_with_model(self._model, ctx_params)
+        ctx_params.n_batch = self.n_batch
         
-        # Initialize a batch that can handle up to 512 tokens at once
-        # n_tokens, n_embd, n_seq_max
-        self._batch = llama_cpp.llama_batch_init(512, 0, 16)
+        # Enable multiple sequences in the KV cache
+        self._ctx = llama_cpp.llama_new_context_with_model(self._model, ctx_params)
+        if not self._ctx:
+            raise RuntimeError("Failed to create llama_context")
 
-    def step(self, active_requests: list[GenerationRequest]) -> list[GenerationResult]:
+        # Initialize a batch structure
+        # n_tokens_max, n_embd, n_seq_max
+        self._batch = llama_cpp.llama_batch_init(self.n_batch, 0, self.max_sequences)
+        
+        # Initialize free slots for sequence IDs (0 to max_sequences - 1)
+        self._free_slots = list(range(self.max_sequences))
+
+    def step(self, active_requests: List[GenerationRequest]) -> List[GenerationResult]:
         """
-        Processes ONE iteration (one token) for all active requests.
+        Processes ONE iteration (token decode) for all active requests.
+        Injects new requests (prefill) and advances existing ones (decode).
         Returns results for any requests that finished in this step.
         """
         if not active_requests:
@@ -137,175 +78,174 @@ class LlamaCppIterationEngine:
 
         finished_results = []
         
-        # Prepare the llama_batch
-        self._batch.n_tokens = 0
-        
-        for i, req in enumerate(active_requests):
-            if req.is_finished:
-                continue
+        with self._lock:
+            # 1. Reset batch
+            self._batch.n_tokens = 0
+            
+            requests_to_process = []
+            
+            for req in active_requests:
+                if req.is_finished:
+                    continue
                 
-            # If this is a new request, we need to prefill
-            if req.tokens_generated == 0:
-                text_bytes = req.prompt.encode()
-                n_max_tokens = len(text_bytes) + 2
-                tokens = (llama_cpp.llama_token * n_max_tokens)()
-                n_tokens = llama_cpp.llama_tokenize(
-                    llama_cpp.llama_model_get_vocab(self._model),
-                    text_bytes,
-                    len(text_bytes),
-                    tokens,
-                    n_max_tokens,
-                    True,
-                    True
-                )
-                if n_tokens < 0:
-                    # Retry with larger buffer if needed
-                    n_tokens = abs(n_tokens)
-                    tokens = (llama_cpp.llama_token * n_tokens)()
-                    llama_tokenize(llama_cpp.llama_model_get_vocab(self._model), text_bytes, len(text_bytes), tokens, n_tokens, True, True)
-                
-                req.token_ids = [tokens[i] for i in range(n_tokens)]
-                req.kv_cache_seq_id = i # Simple sequence mapping
-                
-                # Add prompt tokens to batch
-                for j, tid in enumerate(req.token_ids):
-                    pos = self._batch.n_tokens
-                    self._batch.token[pos] = tid
-                    self._batch.pos[pos] = j
-                    self._batch.n_seq_id[pos] = 1
-                    self._batch.seq_id[pos][0] = req.kv_cache_seq_id
-                    self._batch.logits[pos] = (j == len(req.token_ids) - 1)
-                    self._batch.n_tokens += 1
-            else:
-                # Add just the last generated token for decoding
-                last_token = req.token_ids[-1]
-                pos_in_seq = len(req.token_ids) - 1
-                batch_pos = self._batch.n_tokens
-                self._batch.token[batch_pos] = last_token
-                self._batch.pos[batch_pos] = pos_in_seq
-                self._batch.n_seq_id[batch_pos] = 1
-                self._batch.seq_id[batch_pos][0] = req.kv_cache_seq_id
-                self._batch.logits[batch_pos] = True
-                self._batch.n_tokens += 1
+                # Assign a KV cache sequence ID if not already assigned
+                if req.kv_cache_seq_id == -1:
+                    if not self._free_slots:
+                        logger.warning(f"No free KV cache slots for request {req.request_id}. Skipping.")
+                        continue
+                    req.kv_cache_seq_id = self._free_slots.pop(0)
 
-        # Decode the batch
-        if self._batch.n_tokens > 0:
-            llama_cpp.llama_decode(self._ctx, self._batch)
-            
-            # Get all logits for the batch
-            all_logits = llama_cpp.llama_get_logits(self._ctx)
-            n_vocab = llama_cpp.llama_n_vocab(self._model)
-            
-            import numpy as np
-            # Total number of tokens in batch that requested logits
-            n_logits = sum(1 for i in range(self._batch.n_tokens) if self._batch.logits[i])
-            logits_arr = np.ctypeslib.as_array(all_logits, shape=(n_logits, n_vocab))
-            
-            logit_idx = 0
-            for i, req in enumerate(active_requests):
-                if req.is_finished: continue
-                
-                # The logits for this request are at logit_idx
-                req_logits = logits_arr[logit_idx]
-                logit_idx += 1
-                
-                new_token_id = int(np.argmax(req_logits))
-                
-                req.token_ids.append(new_token_id)
-                req.tokens_generated += 1
-                
-                # Check for finish condition
-                if new_token_id == llama_cpp.llama_token_eos(self._model) or req.tokens_generated >= req.max_new_tokens:
-                    req.is_finished = True
-                    text = llama_cpp.llama_token_to_piece(self._model, new_token_id).decode() # Simplification
-                    req.generated_text += text
+                # 2. Add tokens to batch
+                if req.tokens_generated == 0:
+                    # PREFILL path
+                    text_bytes = req.prompt.encode("utf-8")
+                    # Tokenize the prompt
+                    n_tokens_max = len(req.prompt) + 4
+                    tokens = (llama_cpp.llama_token * n_tokens_max)()
+                    n_tokens = llama_cpp.llama_tokenize(
+                        llama_cpp.llama_model_get_vocab(self._model),
+                        text_bytes,
+                        len(text_bytes),
+                        tokens,
+                        n_tokens_max,
+                        True,  # Add BOS
+                        True   # Special tokens
+                    )
                     
-                    # Create result
-                    now = time.monotonic()
-                    finished_results.append(GenerationResult(
-                        request_id=req.request_id,
-                        workload=req.workload,
-                        output_text=req.generated_text,
-                        queue_wait_ms=(now - req.submitted_at) * 1000.0, # Approximate
-                        end_to_end_latency_ms=(now - req.submitted_at) * 1000.0,
-                        total_tokens=req.tokens_generated
-                    ))
+                    if n_tokens < 0:
+                        # Re-allocate and try again if buffer was too small
+                        n_tokens = abs(n_tokens)
+                        tokens = (llama_cpp.llama_token * n_tokens)()
+                        llama_cpp.llama_tokenize(
+                            llama_cpp.llama_model_get_vocab(self._model),
+                            text_bytes,
+                            len(text_bytes),
+                            tokens,
+                            n_tokens,
+                            True,
+                            True
+                        )
+                    
+                    req.token_ids = [tokens[i] for i in range(n_tokens)]
+                    
+                    # Add all prompt tokens to batch for prefill
+                    for i, tid in enumerate(req.token_ids):
+                        pos = self._batch.n_tokens
+                        self._batch.token[pos] = tid
+                        self._batch.pos[pos] = i
+                        self._batch.n_seq_id[pos] = 1
+                        self._batch.seq_id[pos][0] = req.kv_cache_seq_id
+                        # Only request logits for the very last token of the prompt
+                        self._batch.logits[pos] = (i == len(req.token_ids) - 1)
+                        self._batch.n_tokens += 1
+                        
+                        if self._batch.n_tokens >= self.n_batch:
+                            # We hit the batch limit, stop adding more tokens
+                            break
                 else:
-                    text = llama_cpp.llama_token_to_piece(self._model, new_token_id).decode()
-                    req.generated_text += text
+                    # DECODE path (single token)
+                    last_token = req.token_ids[-1]
+                    pos_in_seq = len(req.token_ids) - 1
+                    batch_pos = self._batch.n_tokens
+                    
+                    self._batch.token[batch_pos] = last_token
+                    self._batch.pos[batch_pos] = pos_in_seq
+                    self._batch.n_seq_id[batch_pos] = 1
+                    self._batch.seq_id[batch_pos][0] = req.kv_cache_seq_id
+                    self._batch.logits[batch_pos] = True
+                    self._batch.n_tokens += 1
+                
+                requests_to_process.append(req)
+                if self._batch.n_tokens >= self.n_batch:
+                    break
+
+            # 3. Execute the batch (decode/prefill)
+            if self._batch.n_tokens > 0:
+                ret = llama_cpp.llama_decode(self._ctx, self._batch)
+                if ret != 0:
+                    logger.error(f"llama_decode failed with error code {ret}")
+                    return []
+                
+                # 4. Extract logits and sample new tokens
+                all_logits = llama_cpp.llama_get_logits(self._ctx)
+                try:
+                    # Use llama_vocab_n_tokens for compatibility
+                    n_vocab = llama_cpp.llama_vocab_n_tokens(llama_cpp.llama_model_get_vocab(self._model))
+                except AttributeError:
+                    # Fallback for older llama-cpp-python versions
+                    n_vocab = llama_cpp.llama_n_vocab(self._model)
+                
+                # Identify which requests in the batch produced logits
+                # (Only those where self._batch.logits[i] was True)
+                logit_indices = [i for i in range(self._batch.n_tokens) if self._batch.logits[i]]
+                
+                for idx, req in enumerate(requests_to_process):
+                    # Find which logit set belongs to this request
+                    # Since we only request 1 logit per request per step, 
+                    # the order in all_logits corresponds to the order in logit_indices
+                    if idx >= len(logit_indices):
+                        continue
+                        
+                    l_idx = logit_indices[idx]
+                    # Map to the numpy array of logits
+                    req_logits = np.ctypeslib.as_array(all_logits + (idx * n_vocab), shape=(n_vocab,))
+                    
+                    # Greedy sampling for production reliability (can be extended with top-p/k)
+                    new_token_id = int(np.argmax(req_logits))
+                    
+                    # Update request state
+                    if req.tokens_generated == 0:
+                        # First token after prefill doesn't add to token_ids (it's already there)
+                        # We just need to check it and start generating
+                        pass
+                    
+                    req.token_ids.append(new_token_id)
+                    req.tokens_generated += 1
+                    
+                    # Detokenize and append to output string
+                    piece = self._detokenize_token(new_token_id)
+                    req.generated_text += piece
+                    
+                    # Check for completion
+                    is_eos = (new_token_id == llama_cpp.llama_token_eos(self._model))
+                    is_limit = (req.tokens_generated >= req.max_new_tokens)
+                    
+                    if is_eos or is_limit:
+                        req.is_finished = True
+                        
+                        # Cleanup KV cache for this sequence
+                        llama_cpp.llama_kv_cache_seq_rm(self._ctx, req.kv_cache_seq_id, -1, -1)
+                        self._free_slots.append(req.kv_cache_seq_id)
+                        
+                        now = time.monotonic()
+                        finished_results.append(GenerationResult(
+                            request_id=req.request_id,
+                            workload=req.workload,
+                            output_text=req.generated_text.strip(),
+                            queue_wait_ms=(now - req.submitted_at) * 1000.0,
+                            end_to_end_latency_ms=(now - req.submitted_at) * 1000.0,
+                            total_tokens=req.tokens_generated
+                        ))
 
         return finished_results
 
+    def _detokenize_token(self, token_id: int) -> str:
+        """Safe detokenization of a single token."""
+        try:
+            # Buffer for the token piece
+            buffer = (llama_cpp.c_char * 128)()
+            n = llama_cpp.llama_token_to_piece(self._model, token_id, buffer, len(buffer), 0, True)
+            if n > 0:
+                return bytes(buffer[:n]).decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.error(f"Detokenization failed for token {token_id}: {e}")
+        return ""
+
     def __del__(self):
-        if self._batch: llama_cpp.llama_batch_free(self._batch)
-        if self._ctx: llama_cpp.llama_free(self._ctx)
-        if self._model: llama_cpp.llama_free_model(self._model)
-@dataclass(slots=True)
-class MlxEngineAdapter:
-    """
-    Adapter for integrating the scheduler with MLX-LM execution.
-    """
-
-    model: any
-    tokenizer: any
-
-    def execute_batch(
-        self,
-        batch: Sequence[GenerationRequest],
-    ) -> tuple[list[GenerationResult], BatchExecutionMetrics]:
-        if not batch:
-            empty = BatchExecutionMetrics(0, 0.0, 0, 0)
-            return [], empty
-
-        import mlx_lm
-        
-        start = time.monotonic()
-        
-        # MLX-LM doesn't have a high-level "batch_generate" that perfectly matches 
-        # our GenerationRequest structure easily, so we loop for now, 
-        # or use internal batched decode if possible.
-        # For simplicity and latency capture, we process them.
-        
-        outputs = []
-        total_generated_tokens = 0
-        total_prompt_tokens = 0
-        
-        for req in batch:
-            # We use mlx_lm.generate
-            # In a real high-throughput scenario, we'd use batched inputs.
-            output = mlx_lm.generate(
-                self.model,
-                self.tokenizer,
-                prompt=req.prompt,
-                max_tokens=req.max_new_tokens,
-                verbose=False
-            )
-            outputs.append(output)
-            # Rough estimate of tokens (word count for now, tokenizer length better)
-            total_generated_tokens += len(output.split())
-            total_prompt_tokens += req.prompt_tokens
-
-        end = time.monotonic()
-        runtime_ms = (end - start) * 1000.0
-
-        results: list[GenerationResult] = []
-        for req, text in zip(batch, outputs):
-            queue_wait_ms = (start - req.submitted_at) * 1000.0
-            e2e_ms = (end - req.submitted_at) * 1000.0
-            results.append(
-                GenerationResult(
-                    request_id=req.request_id,
-                    workload=req.workload,
-                    output_text=text,
-                    queue_wait_ms=max(0.0, queue_wait_ms),
-                    end_to_end_latency_ms=max(0.0, e2e_ms),
-                )
-            )
-
-        metrics = BatchExecutionMetrics(
-            batch_size=len(batch),
-            runtime_ms=max(0.0, runtime_ms),
-            prompt_tokens=total_prompt_tokens,
-            generated_tokens=total_generated_tokens,
-        )
-        return results, metrics
+        # Cleanup C structures
+        if hasattr(self, '_batch') and self._batch:
+            llama_cpp.llama_batch_free(self._batch)
+        if hasattr(self, '_ctx') and self._ctx:
+            llama_cpp.llama_free(self._ctx)
+        if hasattr(self, '_model') and self._model:
+            llama_cpp.llama_free_model(self._model)
